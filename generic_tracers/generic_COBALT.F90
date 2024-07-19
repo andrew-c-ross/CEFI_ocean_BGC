@@ -159,6 +159,13 @@ module generic_COBALT
 
   use FMS_ocmip2_co2calc_mod, only : FMS_ocmip2_co2calc, CO2_dope_vector
 
+  use generic_FEISTY,  only : generic_FEISTY_register, generic_FEISTY_init, generic_FEISTY_register_diag
+  use generic_FEISTY,  only : generic_FEISTY_tracer_get_values, generic_FEISTY_tracer_get_pointer
+  use generic_FEISTY,  only : generic_FEISTY_update_from_coupler, generic_FEISTY_fish_update_from_source
+  use generic_FEISTY,  only : generic_FEISTY_benthic_update_from_source
+  use generic_FEISTY,  only : generic_FEISTY_end
+  use generic_FEISTY,  only : generic_FEISTY_update_pointer, generic_FEISTY_send_diagnostic_data
+
   implicit none ; private
 !-----------------------------------------------------------------------
   character(len=128) :: version = '$Id: generic_COBALT.F90,v 20.0.2.1.2.1 2014/09/29 16:40:08 Niki.Zadeh Exp $'
@@ -200,6 +207,9 @@ module generic_COBALT
   logical :: do_14c             = .false.
   logical :: debug              = .false.
   logical :: do_nh3_atm_ocean_exchange = .false.
+  logical :: do_FEISTY                  = .true.   
+  logical :: do_print_FEISTY_diagnostic = .false.
+  
   ! namelist capabilities for half-sats not used in this run
   logical :: do_vertfill_pre = .false.
   real    :: k_nh4_small = 1.e-8
@@ -224,7 +234,8 @@ module generic_COBALT
 
 namelist /generic_COBALT_nml/ do_14c, co2_calc, debug, do_nh3_atm_ocean_exchange, scheme_nitrif, &
      k_nh4_small,k_nh4_large,k_nh4_diazo,scheme_no3_nh4_lim,k_no3_small,k_no3_large,k_no3_diazo, &
-     o2_min_nit,k_o2_nit,irr_inhibit,k_nh3_nitrif,gamma_nitrif,do_vertfill_pre,imbalance_tolerance
+     o2_min_nit,k_o2_nit,irr_inhibit,k_nh3_nitrif,gamma_nitrif,do_vertfill_pre,imbalance_tolerance, &
+     do_FEISTY,do_print_FEISTY_diagnostic
 
   ! Declare phytoplankton, zooplankton and cobalt variable types, which contain
   ! the vast majority of all variables used in this module.
@@ -516,7 +527,8 @@ namelist /generic_COBALT_nml/ do_14c, co2_calc, debug, do_nh3_atm_ocean_exchange
           id_jprod_ndet_100 = -1, &
           id_jprod_don_100  = -1, &
           id_jremin_n_100   = -1, &
-          id_f_n_100        = -1
+          id_f_n_100        = -1, &
+          id_f_n
   end type zooplankton
 
   type bacteria
@@ -978,6 +990,7 @@ namelist /generic_COBALT_nml/ do_14c, co2_calc, debug, do_nh3_atm_ocean_exchange
           ffe_iceberg,&
           fnfeso4red_sed,&
           fno3denit_sed,&
+          fn_residual_btm, &
           fnoxic_sed,&
           frac_burial,&
           fn_burial,&
@@ -1805,10 +1818,17 @@ contains
     else
       call mpp_error(FATAL,"Unknown co2_calc option specified in generic_COBALT_nml")
     endif
+    
     !Specify all prognostic and diagnostic tracers of this modules.
     call user_add_tracers(tracer_list)
 
+    ! Add FEISTY tracers: 
+    if (do_FEISTY) then 
+          call generic_FEISTY_register(tracer_list)  
+    end if 
+
   end subroutine generic_COBALT_register
+
 
   !  <SUBROUTINE NAME="generic_COBALT_init">
   !  <OVERVIEW>
@@ -1870,8 +1890,14 @@ contains
     id_clock_cobalt_send_diagnostics = mpp_clock_id('(Cobalt: send diagnostics)',grain=CLOCK_MODULE)
     id_clock_cobalt_calc_diagnostics = mpp_clock_id('(Cobalt: calculate diagnostics)',grain=CLOCK_MODULE)
 
-  end subroutine generic_COBALT_init
+    ! Initialiser FEISTY: Add parameters and allocate arrays! 
+    if (do_FEISTY) then
+          call generic_FEISTY_init(tracer_list)
+    end if 
 
+  end subroutine generic_COBALT_init
+ 
+ 
   !   Register diagnostic fields to be used in this module.
   !   Note that the tracer fields are automatically registered in user_add_tracers
   !   User adds only diagnostics for fields that are not a member of g_tracer_type
@@ -6086,10 +6112,12 @@ contains
 ! 2-D fields (from Oday)
 
 ! previously defined above
-
-
 !==============================================================================================================
 
+     ! Register FEISTY diagnostic variable: 
+     if (do_FEISTY) then 
+         call generic_FEISTY_register_diag(diag_list)
+     end if
   end subroutine generic_COBALT_register_diag
 
   !
@@ -7932,8 +7960,12 @@ contains
     real :: tr,ltr
     real :: imbal
     integer :: stdoutunit, imbal_flag, outunit
-    type(g_tracer_type), pointer :: g_tracer,g_tracer_next
+    type(g_tracer_type), pointer :: g_tracer, g_tracer_next
     real :: KD_SMOOTH = 1.0E-05
+
+    ! Local variable added for FEISTY: 
+    real, dimension (:,:), allocatable :: fn_residual_btm
+
 
     if(do_vertfill_pre) then
       g_tracer => tracer_list
@@ -8150,9 +8182,16 @@ contains
     !
     ! zooplankton fields
     !
-    call g_tracer_get_values(tracer_list,'nsmz'    ,'field',zoo(1)%f_n(:,:,:) ,isd,jsd,ntau=tau,positive=.true.)
-    call g_tracer_get_values(tracer_list,'nmdz'    ,'field',zoo(2)%f_n(:,:,:) ,isd,jsd,ntau=tau,positive=.true.)
-    call g_tracer_get_values(tracer_list,'nlgz'    ,'field',zoo(3)%f_n(:,:,:) ,isd,jsd,ntau=tau,positive=.true.)
+    call g_tracer_get_values(tracer_list,'nsmz' ,'field',zoo(1)%f_n(:,:,:) ,isd,jsd,ntau=tau,positive=.true.)
+    call g_tracer_get_values(tracer_list,'nmdz' ,'field',zoo(2)%f_n(:,:,:) ,isd,jsd,ntau=tau,positive=.true.)
+    call g_tracer_get_values(tracer_list,'nlgz' ,'field',zoo(3)%f_n(:,:,:) ,isd,jsd,ntau=tau,positive=.true.)
+    ! 
+    ! fish from FEISTY  
+    ! 
+    if (do_FEISTY) then 
+          call generic_FEISTY_tracer_get_values(tracer_list, isd, jsd, tau)
+    end if 
+
     !
     ! bacteria
     !
@@ -9215,23 +9254,56 @@ contains
        !hp_pa_vec(8) = hp_ipa_vec(8)* &
        !               ( (hp_ipa_vec(8)*prey_vec(8))**cobalt%nswitch_hp / &
        !                 (sw_fac_denom+epsln) )**(1.0/cobalt%mswitch_hp)
-       food1 = hp_ipa_vec(7)*prey_vec(7)
-       food2 = hp_ipa_vec(8)*prey_vec(8)
-       sw_fac_denom = food1**cobalt%nswitch_hp+food2**cobalt%nswitch_hp
-       hp_pa_vec(7) = hp_ipa_vec(7)*(food1**cobalt%nswitch_hp / &
-               (sw_fac_denom+epsln) )**(1.0/cobalt%mswitch_hp)
-       hp_pa_vec(8) = hp_ipa_vec(8)*(food2**cobalt%nswitch_hp / &
-               (sw_fac_denom+epsln) )**(1.0/cobalt%mswitch_hp)
-       tot_prey_hp = hp_pa_vec(7)*prey_vec(7) + hp_pa_vec(8)*prey_vec(8)
-       hp_ingest_vec(7) = cobalt%hp_temp_lim(i,j,k)*cobalt%hp_o2lim(i,j,k)*cobalt%imax_hp* &
-                          hp_pa_vec(7)*prey_vec(7)*tot_prey_hp**(cobalt%coef_hp-1.0)/ &
-                            (cobalt%ki_hp+tot_prey_hp)
-       hp_ingest_vec(8) = cobalt%hp_temp_lim(i,j,k)*cobalt%hp_o2lim(i,j,k)*cobalt%imax_hp* &
-                          hp_pa_vec(8)*prey_vec(8)*tot_prey_hp**(cobalt%coef_hp-1.0)/ &
-                            (cobalt%ki_hp+tot_prey_hp)
+
+       ! Define params: imax_hp, ki_hp, coef_hp, nswitch_hp, mswitch_hp,   ktemp_hp, k_o2, o2_min, hp_ipa_vec
+       if ( do_FEISTY ) then
+          ! FEISTY calculation: 
+          call generic_FEISTY_fish_update_from_source(tracer_list, Temp(i,j,k), prey_vec, hp_ingest_vec, &
+                                                      i, j, k, nk, NUM_PREY, dt, tau, &
+                                                      do_print_FEISTY_diagnostic)
+               ! prey_vec remain unchanged from FEISTY 
+               ! hp_ipa_vec(7:8) is calculated from FEISTY 
+          
+          ! Add non fish mortality on zooplankton :0.1 imax_hp? 
+          food1 = hp_ipa_vec(7)*prey_vec(7)
+          food2 = hp_ipa_vec(8)*prey_vec(8)
+          
+          ! COBALT-fish predation: (with 0.1* cobalt%imax_hp to keep some non-fish mortality on zooplankton) 
+          sw_fac_denom = food1**cobalt%nswitch_hp+food2**cobalt%nswitch_hp
+          hp_pa_vec(7) = hp_ipa_vec(7)*(food1**cobalt%nswitch_hp / &
+                    (sw_fac_denom+epsln) )**(1.0/cobalt%mswitch_hp)
+          hp_pa_vec(8) = hp_ipa_vec(8)*(food2**cobalt%nswitch_hp / &
+                    (sw_fac_denom+epsln) )**(1.0/cobalt%mswitch_hp)
+          tot_prey_hp = hp_pa_vec(7)*prey_vec(7) + hp_pa_vec(8)*prey_vec(8)
+          hp_ingest_vec(7) = cobalt%hp_temp_lim(i,j,k)*cobalt%hp_o2lim(i,j,k)* 0.1*cobalt%imax_hp* &
+                              hp_pa_vec(7)*prey_vec(7)*tot_prey_hp**(cobalt%coef_hp-1.0)/ &
+                              (cobalt%ki_hp+tot_prey_hp)
+          hp_ingest_vec(8) = cobalt%hp_temp_lim(i,j,k)*cobalt%hp_o2lim(i,j,k)* 0.1*cobalt%imax_hp* &
+                              hp_pa_vec(8)*prey_vec(8)*tot_prey_hp**(cobalt%coef_hp-1.0)/ &
+                              (cobalt%ki_hp+tot_prey_hp)
+
+       else ! Former fish predation on zooplankton from COBALT: 
+          food1 = hp_ipa_vec(7)*prey_vec(7)
+          food2 = hp_ipa_vec(8)*prey_vec(8)
+          sw_fac_denom = food1**cobalt%nswitch_hp+food2**cobalt%nswitch_hp
+          hp_pa_vec(7) = hp_ipa_vec(7)*(food1**cobalt%nswitch_hp / &
+                    (sw_fac_denom+epsln) )**(1.0/cobalt%mswitch_hp)
+          hp_pa_vec(8) = hp_ipa_vec(8)*(food2**cobalt%nswitch_hp / &
+                    (sw_fac_denom+epsln) )**(1.0/cobalt%mswitch_hp)
+          tot_prey_hp = hp_pa_vec(7)*prey_vec(7) + hp_pa_vec(8)*prey_vec(8)
+          hp_ingest_vec(7) = cobalt%hp_temp_lim(i,j,k)*cobalt%hp_o2lim(i,j,k)*cobalt%imax_hp* &
+                              hp_pa_vec(7)*prey_vec(7)*tot_prey_hp**(cobalt%coef_hp-1.0)/ &
+                              (cobalt%ki_hp+tot_prey_hp)
+          hp_ingest_vec(8) = cobalt%hp_temp_lim(i,j,k)*cobalt%hp_o2lim(i,j,k)*cobalt%imax_hp* &
+                              hp_pa_vec(8)*prey_vec(8)*tot_prey_hp**(cobalt%coef_hp-1.0)/ &
+                              (cobalt%ki_hp+tot_prey_hp)
+       end if
+
+
        cobalt%hp_jingest_n(i,j,k) = hp_ingest_vec(7) + hp_ingest_vec(8)
        cobalt%hp_jingest_p(i,j,k) = hp_ingest_vec(7)*prey_p2n_vec(7) + &
                                     hp_ingest_vec(8)*prey_p2n_vec(8)
+       
        !
        ! Calculate losses to higher predators
        !
@@ -9784,6 +9856,8 @@ contains
 
     allocate(rho_dzt_bot(isc:iec,jsc:jec))
     allocate(k_bot(isc:iec,jsc:jec))
+    ! added for FEISTY calculation at the bottom:
+    allocate(fn_residual_btm(isc:iec,jsc:jec))
 
     do j = jsc, jec; do i = isc, iec  !{
        if (grid_kmt(i,j) .gt. 0) then !{
@@ -9879,11 +9953,24 @@ contains
              ! Calculate the amount of organic matter (as nitrogen) that is remineralized
              ! via aerobic processes (fnoxic_sed)
              !
+
+               ! FEISTY-bottom: --------------------------------------------------------------------------------
+               !    input : fn_residual_btm, cobalt%btm_temp (old? )
+               !    output : fn_residual_btm 
+               ! -----------------------------------------------------------------------------------------------
+               ! fn_residual_btm: detritus usable for benthic comunities: 
+               fn_residual_btm(i, j) = cobalt%fntot_btm(i,j) - cobalt%fn_burial(i,j) - &
+                                         cobalt%fno3denit_sed(i,j)/cobalt%n_2_n_denit
+
+               if (do_FEISTY) then 
+                  call generic_FEISTY_benthic_update_from_source(fn_residual_btm(i, j), i, j, nk, dt)
+               end if
+
+
              if (cobalt%btm_o2(i,j) .gt. cobalt%o2_min) then  !{
                 cobalt%fnoxic_sed(i,j) = max(0.0, min(cobalt%btm_o2(i,j)*cobalt%bottom_thickness* &
                                          cobalt%Rho_0*r_dt*(1.0/cobalt%o2_2_nh4), &
-                                         cobalt%fntot_btm(i,j) - cobalt%fn_burial(i,j) - &
-                                         cobalt%fno3denit_sed(i,j)/cobalt%n_2_n_denit))
+                                         fn_residual_btm(i, j)))
              else
                 cobalt%fnoxic_sed(i,j) = 0.0
              endif !}
@@ -10065,9 +10152,13 @@ contains
        call g_tracer_get_pointer(tracer_list,'do14c','field',cobalt%p_do14c)
     endif
 
+    if (do_FEISTY) then 
+          call generic_FEISTY_tracer_get_pointer(tracer_list)
+    end if 
+
     ! CAS calculate total N and P before source/sink
     ! calculate internal sources (those not applied as air-sea or benthos
-    ! exchanges) to close the balance
+    ! exchanges) to close the balance.
     allocate(pre_totn(isc:iec,jsc:jec,1:nk))
     allocate(pre_totc(isc:iec,jsc:jec,1:nk))
     allocate(net_srcn(isc:iec,jsc:jec,1:nk))
@@ -10293,8 +10384,17 @@ contains
                              zoo(3)%jhploss_n(i,j,k)
        cobalt%p_nlgz(i,j,k,tau) = cobalt%p_nlgz(i,j,k,tau) + cobalt%jnlgz(i,j,k)*dt*grid_tmask(i,j,k)
     enddo; enddo ; enddo  !} i,j,k
-!
     call mpp_clock_end(id_clock_source_sink_loop4)
+    
+    !
+    !     Fish Derivative: update from pointers 
+    !
+    if (do_FEISTY) then 
+          do k = 1, nk ; do j = jsc, jec ; do i = isc, iec  !{
+               call generic_FEISTY_update_pointer(i, j, k, tau, dt)
+          enddo; enddo ; enddo  !} i,j,k
+     end if 
+
     !
     !     NO3
     !
@@ -11881,6 +11981,24 @@ contains
             model_time, rmask = grid_tmask,&
             is_in=isc, js_in=jsc, ks_in=1,ie_in=iec, je_in=jec, ke_in=nk)
     enddo
+    !--------------------------------------------------------------------------------------
+    ! Send Fish diagnostic data
+    !
+    ! COBALT tracers used for FEISTY offline 
+    if (zoo(2)%id_f_n .gt. 0)     &
+          used = g_send_data(zoo(2)%id_f_n, zoo(2)%f_n,         &
+          model_time, rmask = grid_tmask, &
+          is_in=isc, js_in=jsc, ks_in=1,ie_in=iec, je_in=jec, ke_in=nk)
+
+     if(zoo(3)%id_f_n .gt. 0)     &
+          used = g_send_data(zoo(3)%id_f_n, zoo(3)%f_n,         &
+          model_time, rmask = grid_tmask, &
+          is_in=isc, js_in=jsc, ks_in=1,ie_in=iec, je_in=jec, ke_in=nk)
+    ! Fish tracers and diagnostics 
+    if (do_FEISTY) then 
+          ! FEISTY tracers: 
+          call generic_FEISTY_send_diagnostic_data(model_time)
+    end if 
     !
     ! Production diagnostics
     !
@@ -14889,6 +15007,11 @@ contains
   subroutine generic_COBALT_end
     character(len=fm_string_len), parameter :: sub_name = 'generic_COBALT_end'
     call user_deallocate_arrays
+    
+    ! Deallocate FEISTY arrays: 
+    if (do_FEISTY) then  
+          call generic_FEISTY_end
+    end if 
   end subroutine generic_COBALT_end
 
   !
