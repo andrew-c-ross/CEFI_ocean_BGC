@@ -1,13 +1,13 @@
 module FMS_co2calc_mod  !{
 !
 !This module is renamed from FMS_ocmip2_co2calc.F90
-!It is called FMS_co2calc_mod because now we only support mocsy 
+!It is called FMS_co2calc_mod because now we only support mocsy
 !
 !Modifications:
-!1. mask check should surround all the calculations since MOM restart masks htotal on land 
-!   and htotal cannot be zero in this calculation (division by htotal) 
+!1. mask check should surround all the calculations since MOM restart masks htotal on land
+!   and htotal cannot be zero in this calculation (division by htotal)
 !2. if (mask(i,j) .eq. 0.0) --> if (mask(i,j) .gt. 0.0) for floating point comparison efficiency
-! 
+!
 !<CONTACT EMAIL="Richard.Slater@noaa.gov"> Richard D. Slater
 !</CONTACT>
 !
@@ -64,7 +64,7 @@ real :: epsln = 1.e-10
 real :: minimum_temperature = -2.
 real :: maximum_salinity = 200.
 real :: max_species_value = 4.  ! max_species_value based on pure salt (NaCl) at 200 psu
-                                !       200 (g/kg) / 58.4428 (g/mol) = 3.4 mol/kg 
+                                !       200 (g/kg) / 58.4428 (g/mol) = 3.4 mol/kg
 logical :: sal_floor_based_on_alk = .true.
 logical :: print_oor_warnings = .false.
 logical :: apply_epsln_floor = .true.
@@ -234,15 +234,15 @@ real :: salinity
       if (mask(i,j) .gt. 0.0) then  !{
 
         ! Initialize Mocsy input arrays
-        Patm  = 0. 
-        depth = 0. 
-        lat   = 0. 
-        temp  = 0. 
-        sal   = 0. 
-        alk   = 0. 
-        dic   = 0. 
-        sil   = 0. 
-        phos  = 0. 
+        Patm  = 0.
+        depth = 0.
+        lat   = 0.
+        temp  = 0.
+        sal   = 0.
+        alk   = 0.
+        dic   = 0.
+        sil   = 0.
+        phos  = 0.
 
         ! Initialize salinity array
         salinity = 0.0
